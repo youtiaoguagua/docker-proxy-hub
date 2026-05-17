@@ -1,0 +1,8 @@
+addr: ":8080"
+db_path: "./docker-proxy-hub.db"
+jwt_ttl: "24h"
+cookie_name: "dph_token"
+health_check_interval: "120s"
+log_level: "debug"
+log_format: "text"
+# jwt_secret: ""  # auto-generated if empty, set via env var DPH_JWT_SECRET
