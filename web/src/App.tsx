@@ -5,7 +5,6 @@ import { AppShell } from "@/components/AppShell";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { MonitoringPage } from "@/pages/MonitoringPage";
-import { ProxyConfigPage } from "@/pages/ProxyConfigPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { SetupPage } from "@/pages/SetupPage";
 import { UpstreamsPage } from "@/pages/UpstreamsPage";
@@ -18,7 +17,6 @@ function AuthenticatedLayout() {
       <Routes>
         <Route path="/" element={<DashboardPage />} />
         <Route path="/upstreams" element={<UpstreamsPage />} />
-        <Route path="/proxy" element={<ProxyConfigPage />} />
         <Route path="/monitoring" element={<MonitoringPage />} />
         <Route path="/settings" element={<SettingsPage />} />
         <Route path="/account" element={<AccountPage />} />

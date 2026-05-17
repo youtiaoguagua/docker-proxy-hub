@@ -18,7 +18,7 @@ type Upstream struct {
 	Enabled          bool                `json:"enabled"`
 	HealthEnabled    bool                `json:"healthEnabled"`
 	HealthPath       string              `json:"healthPath"`
-	HttpProxy        string              `json:"httpProxy"`
+	HttpProxy        string              `json:"-"`
 	SpeedTestImage   string              `json:"speedTestImage"`
 	HealthStatus     health.HealthStatus `json:"healthStatus"`
 	LatencyMs        int64               `json:"latencyMs"`
@@ -35,7 +35,6 @@ type UpstreamInput struct {
 	Enabled        bool   `json:"enabled"`
 	HealthEnabled  bool   `json:"healthEnabled"`
 	HealthPath     string `json:"healthPath"`
-	HttpProxy      string `json:"httpProxy"`
 	SpeedTestImage string `json:"speedTestImage"`
 }
 
@@ -54,7 +53,6 @@ func (input UpstreamInput) Normalize() UpstreamInput {
 		input.BaseURL = "https://" + input.BaseURL
 	}
 	input.HealthPath = strings.TrimSpace(input.HealthPath)
-	input.HttpProxy = strings.TrimSpace(input.HttpProxy)
 	input.SpeedTestImage = strings.TrimSpace(input.SpeedTestImage)
 	if input.SpeedTestImage == "" {
 		input.SpeedTestImage = defaultSpeedTestImage(input.RegistryPrefix)
@@ -91,13 +89,13 @@ func defaultSpeedTestImage(prefix string) string {
 	case "docker.io":
 		return "library/alpine"
 	case "ghcr.io":
-		return "ghcr.io/stefanprodan/podinfo"
+		return "stefanprodan/podinfo"
 	case "gcr.io":
-		return "gcr.io/google-containers/pause"
+		return "google-containers/pause"
 	case "quay.io":
-		return "quay.io/prometheus/prometheus"
+		return "prometheus/prometheus"
 	case "registry.k8s.io":
-		return "registry.k8s.io/pause"
+		return "pause"
 	default:
 		return ""
 	}

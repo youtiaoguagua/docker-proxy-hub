@@ -4,7 +4,9 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"docker-proxy-hub/internal/health"
 	"docker-proxy-hub/internal/proxy"
 )
 
@@ -236,5 +238,112 @@ func TestDashboardSummaryEmpty(t *testing.T) {
 	}
 	if summary.RequestsToday != 0 {
 		t.Errorf("expected 0 requests today, got %d", summary.RequestsToday)
+	}
+}
+
+func TestDashboardSummaryUsesHealthAndTodayMetrics(t *testing.T) {
+	store := openTestDB(t)
+	ctx := context.Background()
+
+	healthyUpstream, err := store.CreateUpstream(ctx, proxy.UpstreamInput{
+		RegistryPrefix: "docker.io",
+		Name:           "healthy",
+		BaseURL:        "https://healthy.example.com",
+		Priority:       10,
+		Enabled:        true,
+		HealthEnabled:  true,
+		HealthPath:     "/v2/",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpstream healthy: %v", err)
+	}
+	_, err = store.CreateUpstream(ctx, proxy.UpstreamInput{
+		RegistryPrefix: "docker.io",
+		Name:           "unknown",
+		BaseURL:        "https://unknown.example.com",
+		Priority:       20,
+		Enabled:        true,
+		HealthEnabled:  true,
+		HealthPath:     "/v2/",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpstream unknown: %v", err)
+	}
+	unhealthyUpstream, err := store.CreateUpstream(ctx, proxy.UpstreamInput{
+		RegistryPrefix: "docker.io",
+		Name:           "unhealthy",
+		BaseURL:        "https://unhealthy.example.com",
+		Priority:       30,
+		Enabled:        true,
+		HealthEnabled:  true,
+		HealthPath:     "/v2/",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpstream unhealthy: %v", err)
+	}
+	disabledUpstream, err := store.CreateUpstream(ctx, proxy.UpstreamInput{
+		RegistryPrefix: "docker.io",
+		Name:           "disabled",
+		BaseURL:        "https://disabled.example.com",
+		Priority:       40,
+		Enabled:        false,
+		HealthEnabled:  true,
+		HealthPath:     "/v2/",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpstream disabled: %v", err)
+	}
+
+	if err := store.UpdateUpstreamHealth(ctx, healthyUpstream.ID, HealthRecord{Status: string(health.Healthy), LatencyMs: 80, StatusCode: 200}); err != nil {
+		t.Fatalf("UpdateUpstreamHealth healthy: %v", err)
+	}
+	if err := store.UpdateUpstreamHealth(ctx, unhealthyUpstream.ID, HealthRecord{Status: string(health.Unhealthy), LatencyMs: 900, StatusCode: 503, Error: "upstream failed"}); err != nil {
+		t.Fatalf("UpdateUpstreamHealth unhealthy: %v", err)
+	}
+	if err := store.UpdateUpstreamHealth(ctx, disabledUpstream.ID, HealthRecord{Status: string(health.Unhealthy), LatencyMs: 1200, StatusCode: 500, Error: "disabled upstream"}); err != nil {
+		t.Fatalf("UpdateUpstreamHealth disabled: %v", err)
+	}
+
+	now := time.Now().UTC()
+	yesterday := now.Add(-24 * time.Hour)
+	insertMetric := func(createdAt time.Time, statusCode int, durationMs int64, failover bool) {
+		t.Helper()
+		_, err := store.db.ExecContext(ctx, `INSERT INTO request_metrics (registry_prefix, upstream_id, method, path, status_code, duration_ms, error, failover, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			"docker.io", healthyUpstream.ID, "GET", "/v2/library/alpine/manifests/latest", statusCode, durationMs, "", boolInt(failover), createdAt.Format(time.RFC3339Nano))
+		if err != nil {
+			t.Fatalf("insert request_metrics: %v", err)
+		}
+	}
+	insertMetric(now, 200, 100, false)
+	insertMetric(now, 502, 300, true)
+	insertMetric(yesterday, 500, 700, false)
+
+	summary, err := store.DashboardSummary(ctx)
+	if err != nil {
+		t.Fatalf("DashboardSummary: %v", err)
+	}
+	if summary.UpstreamsTotal != 4 {
+		t.Fatalf("expected 4 upstreams total, got %d", summary.UpstreamsTotal)
+	}
+	if summary.UpstreamsAvailable != 2 {
+		t.Fatalf("expected 2 available upstreams, got %d", summary.UpstreamsAvailable)
+	}
+	if summary.UpstreamsAbnormal != 1 {
+		t.Fatalf("expected 1 abnormal upstream, got %d", summary.UpstreamsAbnormal)
+	}
+	if summary.RequestsToday != 2 {
+		t.Fatalf("expected 2 requests today, got %d", summary.RequestsToday)
+	}
+	if summary.TotalRequests != 3 {
+		t.Fatalf("expected 3 total requests, got %d", summary.TotalRequests)
+	}
+	if summary.AverageLatencyMs != 200 {
+		t.Fatalf("expected 200ms average latency today, got %v", summary.AverageLatencyMs)
+	}
+	if summary.FailoversToday != 1 {
+		t.Fatalf("expected 1 failover today, got %d", summary.FailoversToday)
+	}
+	if summary.ErrorRateToday != 0.5 {
+		t.Fatalf("expected 0.5 error rate today, got %v", summary.ErrorRateToday)
 	}
 }

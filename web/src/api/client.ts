@@ -94,8 +94,25 @@ export function getMonitoringHealth(): Promise<MonitoringData> {
   return request<MonitoringData>("/api/monitoring/health");
 }
 
-export function getRequestLogs(limit = 50): Promise<{ logs: RequestLog[] }> {
-  return request<{ logs: RequestLog[] }>(`/api/monitoring/logs?limit=${limit}`);
+export interface ListLogsParams {
+  limit?: number;
+  offset?: number;
+  registry?: string;
+  status?: number;
+}
+
+export function getRequestLogs(params: ListLogsParams = {}): Promise<{ logs: RequestLog[]; total: number }> {
+  const query = new URLSearchParams();
+  if (params.limit) query.set("limit", String(params.limit));
+  if (params.offset) query.set("offset", String(params.offset));
+  if (params.registry) query.set("registry", params.registry);
+  if (params.status) query.set("status", String(params.status));
+  const qs = query.toString();
+  return request<{ logs: RequestLog[]; total: number }>(`/api/monitoring/logs${qs ? `?${qs}` : ""}`);
+}
+
+export function deleteRequestLogs(): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>("/api/monitoring/logs", { method: "DELETE" });
 }
 
 export function formatError(error: unknown): string {

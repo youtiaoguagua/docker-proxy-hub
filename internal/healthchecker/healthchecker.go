@@ -16,6 +16,7 @@ import (
 	"docker-proxy-hub/internal/db"
 	"docker-proxy-hub/internal/health"
 	"docker-proxy-hub/internal/proxy"
+	"docker-proxy-hub/internal/registry"
 )
 
 type Checker struct {
@@ -323,23 +324,46 @@ func parseAuthChallenge(header string) (realm, service, scope string) {
 	return
 }
 
+func parseSpeedTestImage(registryPrefix, image string) (string, string, error) {
+	image = strings.TrimSpace(strings.TrimPrefix(image, "/"))
+	if image == "" {
+		return "", "", fmt.Errorf("empty image")
+	}
+	if registryPrefix == registry.DockerHubPrefix {
+		image = strings.TrimPrefix(image, registry.DockerHubPrefix+"/")
+	} else if registryPrefix != "" {
+		image = strings.TrimPrefix(image, registryPrefix+"/")
+		image = registryPrefix + "/" + image
+	}
+	target, err := registry.ParseReference("/" + image)
+	if err != nil {
+		return "", "", err
+	}
+	return target.ImagePath, target.Reference, nil
+}
+
 func (c *Checker) speedTest(ctx context.Context, up proxy.Upstream) (proxy.SpeedTestResult, error) {
 	var result proxy.SpeedTestResult
 
-	// Try to get an auth token if the registry requires authentication.
-	token, err := c.getRegistryToken(ctx, up.BaseURL, up.SpeedTestImage)
+	repository, reference, err := parseSpeedTestImage(up.RegistryPrefix, up.SpeedTestImage)
 	if err != nil {
-		// Don't fail here — the registry might not require auth, we'll try anyway.
-		slog.Debug("speed test: could not get auth token, proceeding without", "error", err)
+		return result, fmt.Errorf("invalid speed test image %q: %w", up.SpeedTestImage, err)
+	}
+
+	// Try to get an auth token if the registry requires authentication.
+	token, err := c.getRegistryToken(ctx, up.BaseURL, repository)
+	if err != nil {
+		slog.Debug("speed test: could not get auth token, proceeding without", "upstream", up.Name, "error", err)
 	}
 
 	// Step 1: Download manifest to get a layer digest and measure manifest time.
-	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/latest", up.BaseURL, up.SpeedTestImage)
+	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", up.BaseURL, repository, reference)
+	slog.Info("speed test: fetching manifest", "upstream", up.Name, "repository", repository, "reference", reference, "url", manifestURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
 		return result, fmt.Errorf("failed to create manifest request: %w", err)
 	}
-	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -384,12 +408,12 @@ func (c *Checker) speedTest(ctx context.Context, up proxy.Upstream) (proxy.Speed
 				break
 			}
 		}
-		archURL := fmt.Sprintf("%s/v2/%s/manifests/%s", up.BaseURL, up.SpeedTestImage, digest)
+		archURL := fmt.Sprintf("%s/v2/%s/manifests/%s", up.BaseURL, repository, digest)
 		archReq, err := http.NewRequestWithContext(ctx, http.MethodGet, archURL, nil)
 		if err != nil {
 			return result, fmt.Errorf("failed to create arch manifest request: %w", err)
 		}
-		archReq.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+		archReq.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
 		if token != "" {
 			archReq.Header.Set("Authorization", "Bearer "+token)
 		}
@@ -417,7 +441,7 @@ func (c *Checker) speedTest(ctx context.Context, up proxy.Upstream) (proxy.Speed
 	}
 
 	// Step 2: Download first 1MB of the first layer blob.
-	blobURL := fmt.Sprintf("%s/v2/%s/blobs/%s", up.BaseURL, up.SpeedTestImage, digest)
+	blobURL := fmt.Sprintf("%s/v2/%s/blobs/%s", up.BaseURL, repository, digest)
 	req, err = http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
 	if err != nil {
 		return result, fmt.Errorf("failed to create blob request: %w", err)

@@ -24,7 +24,6 @@ import (
 var frontendRoutes = []string{
 	"/",
 	"/upstreams",
-	"/proxy",
 	"/monitoring",
 	"/settings",
 	"/account",

@@ -2,7 +2,6 @@ package proxy
 
 import (
 	"context"
-	"crypto/tls"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -79,7 +78,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for i, up := range selected {
 		start := time.Now()
 		targetURL := buildTargetURL(up.BaseURL, target)
-		proxyErr := h.forwardRequest(w, r, targetURL, up.HttpProxy)
+		proxyErr := h.forwardRequest(w, r, targetURL)
 		duration := time.Since(start).Milliseconds()
 
 		statusCode := http.StatusBadGateway
@@ -128,19 +127,10 @@ type proxyResponse struct {
 
 func (p proxyResponse) Error() string { return "upstream error" }
 
-func (h *Handler) forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string, httpProxy string) error {
+func (h *Handler) forwardRequest(w http.ResponseWriter, r *http.Request, targetURL string) error {
 	target, err := url.Parse(targetURL)
 	if err != nil {
 		return err
-	}
-
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	if httpProxy != "" {
-		proxyURL, err := url.Parse(httpProxy)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: false}
-		}
 	}
 
 	proxy := &httputil.ReverseProxy{
@@ -151,7 +141,6 @@ func (h *Handler) forwardRequest(w http.ResponseWriter, r *http.Request, targetU
 				req.Header.Set("User-Agent", "Docker-Proxy-Hub/1.0")
 			}
 		},
-		Transport: transport,
 	}
 
 	rw := &responseWriter{ResponseWriter: w}
@@ -174,8 +163,5 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 func buildTargetURL(baseURL string, target registry.Target) string {
 	path := "/v2/" + target.ImagePath + "/" + target.Action + "/" + target.Reference
-	if target.RegistryPrefix != registry.DockerHubPrefix {
-		path = "/v2/" + target.RegistryPrefix + "/" + target.ImagePath + "/" + target.Action + "/" + target.Reference
-	}
 	return baseURL + path
 }

@@ -63,6 +63,7 @@ func NewRouter(deps Dependencies) *gin.Engine {
 	authGroup.POST("/api/upstreams/:id/speed-test", server.speedTest)
 	authGroup.GET("/api/monitoring/health", server.monitoringHealth)
 	authGroup.GET("/api/monitoring/logs", server.monitoringLogs)
+	authGroup.DELETE("/api/monitoring/logs", server.clearLogs)
 
 	return r
 }
@@ -278,15 +279,49 @@ func (s *Server) monitoringLogs(c *gin.Context) {
 			limit = n
 		}
 	}
-	logs, err := s.deps.Store.ListRequestLogs(c.Request.Context(), limit)
+	offset := 0
+	if v := c.Query("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	registry := c.Query("registry")
+	statusCode := 0
+	if v := c.Query("status"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && (n == 2 || n == 4 || n == 5) {
+			statusCode = n
+		}
+	}
+
+	filter := db.ListLogsFilter{
+		RegistryPrefix: registry,
+		StatusCode:     statusCode,
+		Offset:         offset,
+		Limit:          limit,
+	}
+
+	logs, err := s.deps.Store.ListRequestLogsWithFilters(c.Request.Context(), filter)
 	if err != nil {
 		writeError(c, http.StatusInternalServerError, "internal_error", "failed to load request logs")
+		return
+	}
+	total, err := s.deps.Store.CountRequestLogs(c.Request.Context(), registry, statusCode)
+	if err != nil {
+		writeError(c, http.StatusInternalServerError, "internal_error", "failed to count request logs")
 		return
 	}
 	if logs == nil {
 		logs = []db.RequestLog{}
 	}
-	c.JSON(http.StatusOK, gin.H{"logs": logs})
+	c.JSON(http.StatusOK, gin.H{"logs": logs, "total": total})
+}
+
+func (s *Server) clearLogs(c *gin.Context) {
+	if err := s.deps.Store.DeleteAllRequestLogs(c.Request.Context()); err != nil {
+		writeError(c, http.StatusInternalServerError, "internal_error", "failed to clear logs")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (s *Server) requireAuth() gin.HandlerFunc {
@@ -343,6 +378,11 @@ type changeAdminRequest struct {
 }
 
 func writeError(c *gin.Context, status int, code, message string) {
+	if status >= 500 {
+		slog.Error("api error", "method", c.Request.Method, "path", c.Request.URL.Path, "status", status, "code", code, "message", message)
+	} else {
+		slog.Warn("api client error", "method", c.Request.Method, "path", c.Request.URL.Path, "status", status, "code", code, "message", message)
+	}
 	c.JSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
 }
 
@@ -359,13 +399,27 @@ func requestLogger() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		path := c.Request.URL.Path
+		query := c.Request.URL.RawQuery
 		c.Next()
-		slog.Info("api request",
+
+		attrs := []any{
 			"method", c.Request.Method,
 			"path", path,
 			"status", c.Writer.Status(),
 			"latency_ms", time.Since(start).Milliseconds(),
 			"client_ip", c.ClientIP(),
-		)
+		}
+		if query != "" {
+			attrs = append(attrs, "query", query)
+		}
+		if c.Request.ContentLength > 0 {
+			attrs = append(attrs, "body_bytes", c.Request.ContentLength)
+		}
+		status := c.Writer.Status()
+		if status >= 500 {
+			slog.Error("api request", attrs...)
+		} else {
+			slog.Info("api request", attrs...)
+		}
 	}
 }

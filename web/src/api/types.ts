@@ -23,7 +23,6 @@ export type Upstream = {
   enabled: boolean;
   healthEnabled: boolean;
   healthPath: string;
-  httpProxy: string;
   speedTestImage: string;
   healthStatus: string;
   latencyMs: number;
@@ -40,7 +39,6 @@ export type UpstreamInput = {
   enabled: boolean;
   healthEnabled: boolean;
   healthPath: string;
-  httpProxy: string;
   speedTestImage: string;
 };
 
@@ -58,6 +56,7 @@ export type RequestLog = {
   id: number;
   registryPrefix: string;
   upstreamId: number;
+  upstreamName: string;
   method: string;
   path: string;
   statusCode: number;

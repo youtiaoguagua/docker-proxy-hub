@@ -5,7 +5,6 @@ import {
   Globe2,
   Moon,
   Settings,
-  Shield,
   Sun,
   User,
 } from "lucide-react";
@@ -16,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/components/ThemeProvider";
 
-type PageKey = "dashboard" | "upstreams" | "proxy" | "monitoring" | "settings" | "account" | "docs";
+type PageKey = "dashboard" | "upstreams" | "monitoring" | "settings" | "account" | "docs";
 
 type NavItem = {
   key: PageKey;
@@ -28,7 +27,6 @@ type NavItem = {
 const navItems: NavItem[] = [
   { key: "dashboard", label: "仪表盘", icon: Gauge, path: "/" },
   { key: "upstreams", label: "上游管理", icon: Globe2, path: "/upstreams" },
-  { key: "proxy", label: "代理配置", icon: Shield, path: "/proxy" },
   { key: "monitoring", label: "监控日志", icon: Activity, path: "/monitoring" },
   { key: "settings", label: "系统设置", icon: Settings, path: "/settings" },
   { key: "account", label: "账号管理", icon: User, path: "/account" },

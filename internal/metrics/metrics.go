@@ -11,7 +11,7 @@ type DashboardSummary struct {
 	UpstreamsAbnormal  int64   `json:"upstreamsAbnormal"`
 	RequestsToday      int64   `json:"requestsToday"`
 	TotalRequests      int64   `json:"totalRequests"`
-	AverageLatencyMs   int64   `json:"averageLatencyMs"`
+	AverageLatencyMs   float64 `json:"averageLatencyMs"`
 	FailoversToday     int64   `json:"failoversToday"`
 	ErrorRateToday     float64 `json:"errorRateToday"`
 }

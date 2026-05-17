@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"docker-proxy-hub/internal/auth"
@@ -179,7 +180,7 @@ func (s *Store) CreateUpstream(ctx context.Context, input proxy.UpstreamInput) (
 		return proxy.Upstream{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, `INSERT INTO upstreams (registry_prefix, name, base_url, priority, enabled, health_enabled, health_path, http_proxy, speed_test_image, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, input.RegistryPrefix, input.Name, input.BaseURL, input.Priority, boolInt(input.Enabled), boolInt(input.HealthEnabled), input.HealthPath, input.HttpProxy, input.SpeedTestImage, now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO upstreams (registry_prefix, name, base_url, priority, enabled, health_enabled, health_path, speed_test_image, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, input.RegistryPrefix, input.Name, input.BaseURL, input.Priority, boolInt(input.Enabled), boolInt(input.HealthEnabled), input.HealthPath, input.SpeedTestImage, now, now)
 	if err != nil {
 		return proxy.Upstream{}, err
 	}
@@ -201,7 +202,7 @@ func (s *Store) UpdateUpstream(ctx context.Context, id int64, input proxy.Upstre
 		return proxy.Upstream{}, err
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET registry_prefix = ?, name = ?, base_url = ?, priority = ?, enabled = ?, health_enabled = ?, health_path = ?, http_proxy = ?, speed_test_image = ?, updated_at = ? WHERE id = ?`, input.RegistryPrefix, input.Name, input.BaseURL, input.Priority, boolInt(input.Enabled), boolInt(input.HealthEnabled), input.HealthPath, input.HttpProxy, input.SpeedTestImage, now, id)
+	result, err := s.db.ExecContext(ctx, `UPDATE upstreams SET registry_prefix = ?, name = ?, base_url = ?, priority = ?, enabled = ?, health_enabled = ?, health_path = ?, speed_test_image = ?, updated_at = ? WHERE id = ?`, input.RegistryPrefix, input.Name, input.BaseURL, input.Priority, boolInt(input.Enabled), boolInt(input.HealthEnabled), input.HealthPath, input.SpeedTestImage, now, id)
 	if err != nil {
 		return proxy.Upstream{}, err
 	}
@@ -286,6 +287,7 @@ type RequestLog struct {
 	ID             int64  `json:"id"`
 	RegistryPrefix string `json:"registryPrefix"`
 	UpstreamID     int64  `json:"upstreamId"`
+	UpstreamName   string `json:"upstreamName"`
 	Method         string `json:"method"`
 	Path           string `json:"path"`
 	StatusCode     int    `json:"statusCode"`
@@ -295,11 +297,44 @@ type RequestLog struct {
 	CreatedAt      string `json:"createdAt"`
 }
 
+type ListLogsFilter struct {
+	RegistryPrefix string
+	StatusCode     int // 0 = no filter, 2 = 2xx, 4 = 4xx, 5 = 5xx
+	Offset         int
+	Limit          int
+}
+
 func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, error) {
-	if limit <= 0 || limit > 200 {
-		limit = 50
+	return s.ListRequestLogsWithFilters(ctx, ListLogsFilter{Limit: limit})
+}
+
+func (s *Store) ListRequestLogsWithFilters(ctx context.Context, filter ListLogsFilter) ([]RequestLog, error) {
+	if filter.Limit <= 0 || filter.Limit > 200 {
+		filter.Limit = 50
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT id, registry_prefix, upstream_id, method, path, status_code, duration_ms, error, failover, created_at FROM request_metrics ORDER BY id DESC LIMIT ?`, limit)
+	if filter.Offset < 0 {
+		filter.Offset = 0
+	}
+
+	query := `SELECT r.id, r.registry_prefix, r.upstream_id, COALESCE(u.name, ''), r.method, r.path, r.status_code, r.duration_ms, r.error, r.failover, r.created_at FROM request_metrics r LEFT JOIN upstreams u ON r.upstream_id = u.id`
+	var args []any
+	var conditions []string
+
+	if filter.RegistryPrefix != "" {
+		conditions = append(conditions, "r.registry_prefix = ?")
+		args = append(args, filter.RegistryPrefix)
+	}
+	if filter.StatusCode > 0 {
+		conditions = append(conditions, "r.status_code >= ? AND r.status_code < ?")
+		args = append(args, filter.StatusCode*100, (filter.StatusCode+1)*100)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY r.id DESC LIMIT ? OFFSET ?"
+	args = append(args, filter.Limit, filter.Offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +343,7 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	for rows.Next() {
 		var log RequestLog
 		var failover int
-		if err := rows.Scan(&log.ID, &log.RegistryPrefix, &log.UpstreamID, &log.Method, &log.Path, &log.StatusCode, &log.DurationMs, &log.Error, &failover, &log.CreatedAt); err != nil {
+		if err := rows.Scan(&log.ID, &log.RegistryPrefix, &log.UpstreamID, &log.UpstreamName, &log.Method, &log.Path, &log.StatusCode, &log.DurationMs, &log.Error, &failover, &log.CreatedAt); err != nil {
 			return nil, err
 		}
 		log.Failover = failover == 1
@@ -317,16 +352,41 @@ func (s *Store) ListRequestLogs(ctx context.Context, limit int) ([]RequestLog, e
 	return logs, rows.Err()
 }
 
+func (s *Store) CountRequestLogs(ctx context.Context, registryPrefix string, statusCode int) (int64, error) {
+	query := "SELECT COUNT(*) FROM request_metrics"
+	var args []any
+	var conditions []string
+	if registryPrefix != "" {
+		conditions = append(conditions, "registry_prefix = ?")
+		args = append(args, registryPrefix)
+	}
+	if statusCode > 0 {
+		conditions = append(conditions, "status_code >= ? AND status_code < ?")
+		args = append(args, statusCode*100, (statusCode+1)*100)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	var count int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&count)
+	return count, err
+}
+
+func (s *Store) DeleteAllRequestLogs(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM request_metrics`)
+	return err
+}
+
 func (s *Store) DashboardSummary(ctx context.Context) (metrics.DashboardSummary, error) {
 	var summary metrics.DashboardSummary
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN enabled = 0 THEN 1 ELSE 0 END), 0) FROM upstreams`).Scan(&summary.UpstreamsTotal, &summary.UpstreamsAvailable, &summary.UpstreamsAbnormal); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN u.enabled = 1 AND COALESCE(h.status, 'unknown') != 'unhealthy' THEN 1 ELSE 0 END), 0), COALESCE(SUM(CASE WHEN u.enabled = 1 AND COALESCE(h.status, 'unknown') = 'unhealthy' THEN 1 ELSE 0 END), 0) FROM upstreams u LEFT JOIN upstream_health h ON u.id = h.upstream_id`).Scan(&summary.UpstreamsTotal, &summary.UpstreamsAvailable, &summary.UpstreamsAbnormal); err != nil {
 		return metrics.DashboardSummary{}, err
 	}
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(AVG(duration_ms), 0), COALESCE(SUM(CASE WHEN failover = 1 THEN 1 ELSE 0 END), 0) FROM request_metrics WHERE date(created_at) = date('now')`).Scan(&summary.RequestsToday, &summary.AverageLatencyMs, &summary.FailoversToday); err != nil {
 		return metrics.DashboardSummary{}, err
 	}
 	var failedToday int64
-	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) FROM request_metrics`).Scan(&summary.TotalRequests, &failedToday); err != nil {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*), COALESCE(SUM(CASE WHEN date(created_at) = date('now') AND status_code >= 400 THEN 1 ELSE 0 END), 0) FROM request_metrics`).Scan(&summary.TotalRequests, &failedToday); err != nil {
 		return metrics.DashboardSummary{}, err
 	}
 	if summary.RequestsToday > 0 {
