@@ -1,0 +1,13 @@
+{
+  "name": "docker-proxy-hub",
+  "private": true,
+  "scripts": {
+    "dev:web": "pnpm --dir web dev",
+    "build:web": "pnpm --dir web build",
+    "lint:web": "pnpm --dir web lint",
+    "typecheck:web": "pnpm --dir web typecheck",
+    "dev:server": "go run ./cmd/server",
+    "test:server": "go test ./...",
+    "build:server": "go build -o bin/docker-proxy-hub ./cmd/server"
+  }
+}

@@ -1,0 +1,53 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Frontend build artifacts
+web/dist/
+web/.vite/
+web/node_modules/
+web/coverage/
+
+# TypeScript incremental builds
+*.tsbuildinfo
+web/node_modules/.tmp/
+
+# Go build artifacts
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+data/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude local settings
+.claude/settings.local.json
+config.yaml
