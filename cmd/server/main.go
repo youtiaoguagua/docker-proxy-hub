@@ -68,7 +68,11 @@ func isFrontendPath(path string) bool {
 
 func main() {
 	ctx := context.Background()
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
+	}
 
 	logger.Init(cfg.LogLevel, cfg.LogFormat)
 
