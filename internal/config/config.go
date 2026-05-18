@@ -19,7 +19,7 @@ type Config struct {
 	LogFormat           string
 }
 
-func Load() Config {
+func Load() (Config, error) {
 	v := viper.New()
 
 	v.SetDefault("addr", ":8080")
@@ -40,29 +40,20 @@ func Load() Config {
 	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_", "-", "_"))
 	v.AutomaticEnv()
 
-	_ = v.BindEnv("addr")
-	_ = v.BindEnv("db_path")
-	_ = v.BindEnv("jwt_secret")
-	_ = v.BindEnv("jwt_ttl")
-	_ = v.BindEnv("cookie_name")
-	_ = v.BindEnv("health_check_interval")
-	_ = v.BindEnv("log_level")
-	_ = v.BindEnv("log_format")
-
 	if err := v.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-			panic(fmt.Sprintf("failed to read config: %v", err))
+			return Config{}, fmt.Errorf("read config: %w", err)
 		}
 	}
 
 	jwtTTL, err := time.ParseDuration(v.GetString("jwt_ttl"))
 	if err != nil {
-		jwtTTL = 24 * time.Hour
+		return Config{}, fmt.Errorf("invalid jwt_ttl: %w", err)
 	}
 
 	healthCheckInterval, err := time.ParseDuration(v.GetString("health_check_interval"))
 	if err != nil {
-		healthCheckInterval = 30 * time.Second
+		return Config{}, fmt.Errorf("invalid health_check_interval: %w", err)
 	}
 
 	return Config{
@@ -74,5 +65,5 @@ func Load() Config {
 		HealthCheckInterval: healthCheckInterval,
 		LogLevel:            v.GetString("log_level"),
 		LogFormat:           v.GetString("log_format"),
-	}
+	}, nil
 }
