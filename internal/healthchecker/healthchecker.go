@@ -2,7 +2,6 @@ package healthchecker
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,25 +15,43 @@ import (
 	"docker-proxy-hub/internal/db"
 	"docker-proxy-hub/internal/health"
 	"docker-proxy-hub/internal/proxy"
-	"docker-proxy-hub/internal/registry"
+)
+
+const (
+	speedTestTokenTimeout       = 10 * time.Second
+	speedTestManifestTimeout    = 10 * time.Second
+	speedTestTimeout            = time.Minute
+	speedTestDownloadLimitBytes = int64(4 * 1024 * 1024)
 )
 
 type Checker struct {
-	store       *db.Store
-	client      *http.Client
-	speedClient *http.Client
-	interval     time.Duration
-	mu          sync.RWMutex
-	results     map[int64]proxy.Upstream
-	done        chan struct{}
+	store    *db.Store
+	client   *http.Client
+	interval time.Duration
+	mu       sync.RWMutex
+	results  map[int64]proxy.Upstream
+	done     chan struct{}
+}
+
+type dockerManifest struct {
+	Layers []struct {
+		Digest string `json:"digest"`
+	} `json:"layers"`
+}
+
+type dockerManifestList struct {
+	Manifests []struct {
+		Digest   string `json:"digest"`
+		Platform struct {
+			Architecture string `json:"architecture"`
+			OS           string `json:"os"`
+		} `json:"platform"`
+	} `json:"manifests"`
 }
 
 func NewChecker(store *db.Store, interval time.Duration) *Checker {
 	if interval <= 0 {
 		interval = 30 * time.Second
-	}
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
 	}
 	return &Checker{
 		store:    store,
@@ -42,12 +59,7 @@ func NewChecker(store *db.Store, interval time.Duration) *Checker {
 		results:  make(map[int64]proxy.Upstream),
 		done:     make(chan struct{}),
 		client: &http.Client{
-			Timeout:   10 * time.Second,
-			Transport: transport,
-		},
-		speedClient: &http.Client{
-			Timeout:   30 * time.Second,
-			Transport: transport,
+			Timeout: 10 * time.Second,
 		},
 	}
 }
@@ -200,29 +212,8 @@ func (c *Checker) ForceCheckOne(ctx context.Context, upstreamID int64) {
 	}
 }
 
-// dockerManifest matches the Docker Registry v2 manifest v2 schema.
-type dockerManifest struct {
-	Config struct {
-		Digest string `json:"digest"`
-	} `json:"config"`
-	Layers []struct {
-		Digest string `json:"digest"`
-	} `json:"layers"`
-}
-
-// dockerManifestList matches the Docker Registry v2 manifest list (multi-arch).
-type dockerManifestList struct {
-	Manifests []struct {
-		Digest   string `json:"digest"`
-		Platform struct {
-			Architecture string `json:"architecture"`
-			OS           string `json:"os"`
-		} `json:"platform"`
-	} `json:"manifests"`
-}
-
-// SpeedTestOne performs a speed test on a single upstream by downloading its
-// manifest and then the first 1MB of a layer blob.
+// SpeedTestOne performs a speed test on a single upstream by fetching its
+// manifest and downloading a partial blob range.
 func (c *Checker) SpeedTestOne(ctx context.Context, upstreamID int64) (proxy.Upstream, error) {
 	up, err := c.store.GetUpstream(ctx, upstreamID)
 	if err != nil {
@@ -239,38 +230,287 @@ func (c *Checker) SpeedTestOne(ctx context.Context, upstreamID int64) (proxy.Ups
 	if err := c.store.UpdateSpeedTest(ctx, up.ID, result); err != nil {
 		slog.Error("speed test: failed to record result", "upstream_id", up.ID, "upstream", up.Name, "error", err)
 	}
-	return c.store.GetUpstream(ctx, up.ID)
+	return c.store.GetUpstream(ctx, upstreamID)
 }
 
-// getRegistryToken attempts to obtain an anonymous auth token from the
-// Docker Registry v2 Www-Authenticate challenge. Many registries require
-// this token even for public pulls.
-func (c *Checker) getRegistryToken(ctx context.Context, baseURL, image string) (string, error) {
-	// Hit /v2/ to get the auth challenge.
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v2/", nil)
+func (c *Checker) speedTest(ctx context.Context, up proxy.Upstream) (proxy.SpeedTestResult, error) {
+	var result proxy.SpeedTestResult
+
+	client := newSpeedTestHTTPClient(up)
+	image := normalizeSpeedTestImage(up.RegistryPrefix, up.SpeedTestImage)
+	repository, reference, err := splitImageReference(image)
 	if err != nil {
-		return "", err
+		return result, fmt.Errorf("invalid image reference %q: %w", image, err)
 	}
-	resp, err := c.speedClient.Do(req)
+
+	tokenCtx, cancel := speedTestStageContext(ctx, speedTestTokenTimeout)
+	token, err := getRegistryToken(tokenCtx, client, up.BaseURL, repository)
+	cancel()
 	if err != nil {
-		return "", err
+		slog.Debug("speed test: could not get auth token, proceeding without",
+			"upstream", up.Name,
+			"repository", repository,
+			"error", err,
+		)
 	}
-	resp.Body.Close()
+
+	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", strings.TrimRight(up.BaseURL, "/"), repository, reference)
+	slog.Info("speed test: fetching manifest",
+		"upstream", up.Name,
+		"image", image,
+		"manifest_url", manifestURL,
+	)
+	start := time.Now()
+	manifestCtx, cancel := speedTestStageContext(ctx, speedTestManifestTimeout)
+	resp, body, err := fetchManifestDebug(manifestCtx, client, manifestURL, token)
+	cancel()
+	result.ManifestTimeMs = time.Since(start).Milliseconds()
+	if err != nil {
+		c.logSpeedTestDiagnostics(ctx, up, image, err)
+		return result, fmt.Errorf("manifest request failed: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		c.logSpeedTestDiagnostics(ctx, up, image, fmt.Errorf("manifest returned status %d", resp.StatusCode))
+		return result, fmt.Errorf("manifest returned status %d body=%q", resp.StatusCode, formatLogBody(body))
+	}
+
+	resolveCtx, cancel := speedTestStageContext(ctx, speedTestManifestTimeout)
+	layerDigest, err := resolveLayerDigest(resolveCtx, client, up.BaseURL, repository, body, token)
+	cancel()
+	if err != nil {
+		c.logSpeedTestDiagnostics(ctx, up, image, err)
+		return result, err
+	}
+
+	blobURL := fmt.Sprintf("%s/v2/%s/blobs/%s", strings.TrimRight(up.BaseURL, "/"), repository, layerDigest)
+	slog.Info("speed test: downloading blob range",
+		"upstream", up.Name,
+		"image", image,
+		"blob_url", blobURL,
+		"bytes", speedTestDownloadLimitBytes,
+	)
+	blobCtx, cancel := speedTestStageContext(ctx, speedTestTimeout)
+	downloaded, elapsedMs, err := downloadBlobRange(blobCtx, client, blobURL, token, speedTestDownloadLimitBytes)
+	cancel()
+	if err != nil {
+		return result, fmt.Errorf("blob request failed: %w", err)
+	}
+
+	result.DownloadBytes = downloaded
+	result.DownloadTimeMs = elapsedMs
+	if result.DownloadTimeMs > 0 {
+		result.DownloadSpeedKbps = float64(downloaded) / float64(result.DownloadTimeMs) * 1000 / 1024
+	}
+
+	slog.Info("speed test: download complete",
+		"upstream", up.Name,
+		"downloaded_mb", float64(downloaded)/1024/1024,
+		"elapsed_ms", result.DownloadTimeMs,
+		"speed_kbps", result.DownloadSpeedKbps,
+	)
+
+	return result, nil
+}
+
+func (c *Checker) logSpeedTestDiagnostics(ctx context.Context, up proxy.Upstream, image string, copyErr error) {
+	repository, reference, err := splitImageReference(image)
+	if err != nil {
+		slog.Warn("speed test: failed to parse image for diagnostics",
+			"upstream", up.Name,
+			"image", image,
+			"copy_error", copyErr,
+			"error", err,
+		)
+		return
+	}
+
+	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", strings.TrimRight(up.BaseURL, "/"), repository, reference)
+	client := newSpeedTestHTTPClient(up)
+
+	slog.Warn("speed test: collecting manifest diagnostics",
+		"upstream", up.Name,
+		"image", image,
+		"repository", repository,
+		"reference", reference,
+		"manifest_url", manifestURL,
+		"copy_error", copyErr,
+	)
+
+	resp, body, err := fetchManifestDebug(ctx, client, manifestURL, "")
+	if err != nil {
+		slog.Warn("speed test: anonymous manifest request failed",
+			"upstream", up.Name,
+			"manifest_url", manifestURL,
+			"error", err,
+		)
+		return
+	}
+	logManifestDebug("anonymous", resp, body)
 
 	if resp.StatusCode != http.StatusUnauthorized {
-		// No auth required.
+		return
+	}
+
+	token, err := getRegistryToken(ctx, client, up.BaseURL, repository)
+	if err != nil {
+		slog.Warn("speed test: token request failed",
+			"upstream", up.Name,
+			"repository", repository,
+			"error", err,
+		)
+		return
+	}
+
+	resp, body, err = fetchManifestDebug(ctx, client, manifestURL, token)
+	if err != nil {
+		slog.Warn("speed test: authorized manifest request failed",
+			"upstream", up.Name,
+			"manifest_url", manifestURL,
+			"error", err,
+		)
+		return
+	}
+	logManifestDebug("authorized", resp, body)
+}
+
+func normalizeSpeedTestImage(registryPrefix, image string) string {
+	image = strings.TrimSpace(strings.TrimPrefix(image, "/"))
+	if registryPrefix != "" {
+		image = strings.TrimPrefix(image, registryPrefix+"/")
+	}
+
+	name := image
+	suffix := ""
+	if idx := strings.Index(image, "@"); idx >= 0 {
+		name = image[:idx]
+		suffix = image[idx:]
+	} else {
+		slash := strings.LastIndex(image, "/")
+		colon := strings.LastIndex(image, ":")
+		if colon > slash {
+			name = image[:colon]
+			suffix = image[colon:]
+		} else {
+			suffix = ":latest"
+		}
+	}
+
+	if registryPrefix == "docker.io" && !strings.Contains(name, "/") {
+		name = "library/" + name
+	}
+
+	return name + suffix
+}
+
+func splitImageReference(image string) (string, string, error) {
+	if image == "" {
+		return "", "", fmt.Errorf("empty image")
+	}
+	if idx := strings.Index(image, "@"); idx >= 0 {
+		if idx == 0 || idx == len(image)-1 {
+			return "", "", fmt.Errorf("invalid digest reference %q", image)
+		}
+		return image[:idx], image[idx+1:], nil
+	}
+
+	slash := strings.LastIndex(image, "/")
+	colon := strings.LastIndex(image, ":")
+	if colon > slash {
+		return image[:colon], image[colon+1:], nil
+	}
+	return image, "latest", nil
+}
+
+func resolveLayerDigest(ctx context.Context, client *http.Client, baseURL, repository string, body []byte, token string) (string, error) {
+	var manifest dockerManifest
+	if err := json.Unmarshal(body, &manifest); err == nil && len(manifest.Layers) > 0 {
+		return manifest.Layers[0].Digest, nil
+	}
+
+	var list dockerManifestList
+	if err := json.Unmarshal(body, &list); err != nil || len(list.Manifests) == 0 {
+		return "", fmt.Errorf("manifest has no layers and is not a manifest list")
+	}
+
+	manifestDigest := list.Manifests[0].Digest
+	for _, item := range list.Manifests {
+		if item.Platform.OS == "linux" && item.Platform.Architecture == "amd64" {
+			manifestDigest = item.Digest
+			break
+		}
+	}
+
+	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", strings.TrimRight(baseURL, "/"), repository, manifestDigest)
+	resp, manifestBody, err := fetchManifestDebug(ctx, client, manifestURL, token)
+	if err != nil {
+		return "", fmt.Errorf("arch manifest request failed: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return "", fmt.Errorf("arch manifest returned status %d body=%q", resp.StatusCode, formatLogBody(manifestBody))
+	}
+	if err := json.Unmarshal(manifestBody, &manifest); err != nil {
+		return "", fmt.Errorf("failed to parse arch manifest: %w", err)
+	}
+	if len(manifest.Layers) == 0 {
+		return "", fmt.Errorf("arch manifest has no layers")
+	}
+	return manifest.Layers[0].Digest, nil
+}
+
+func downloadBlobRange(ctx context.Context, client *http.Client, blobURL, token string, limitBytes int64) (int64, int64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", limitBytes-1))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, time.Since(start).Milliseconds(), err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, time.Since(start).Milliseconds(), fmt.Errorf("blob returned status %d body=%q", resp.StatusCode, formatLogBody(body))
+	}
+
+	n, err := io.Copy(io.Discard, io.LimitReader(resp.Body, limitBytes))
+	return n, time.Since(start).Milliseconds(), err
+}
+
+func speedTestStageContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(parent, timeout)
+}
+
+func getRegistryToken(ctx context.Context, client *http.Client, baseURL, image string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v2/", nil)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusUnauthorized {
 		return "", nil
 	}
 
-	// Parse Www-Authenticate: Bearer realm="...",service="...",scope="..."
-	authHeader := resp.Header.Get("Www-Authenticate")
-	realm, service, scope := parseAuthChallenge(authHeader)
+	realm, service, scope := parseAuthChallenge(resp.Header.Get("Www-Authenticate"))
 	if realm == "" {
 		return "", fmt.Errorf("no realm in Www-Authenticate header")
 	}
 
-	// Build token URL with scope for the specific repository.
-	tokenURL, _ := url.Parse(realm)
+	tokenURL, err := url.Parse(realm)
+	if err != nil {
+		return "", err
+	}
 	q := tokenURL.Query()
 	if service != "" {
 		q.Set("service", service)
@@ -285,25 +525,34 @@ func (c *Checker) getRegistryToken(ctx context.Context, baseURL, image string) (
 	if err != nil {
 		return "", err
 	}
-	tokenResp, err := c.speedClient.Do(tokenReq)
+	resp, err = client.Do(tokenReq)
 	if err != nil {
 		return "", err
 	}
-	defer tokenResp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("token endpoint returned %d body=%q", resp.StatusCode, formatLogBody(body))
+	}
 
 	var tokenResult struct {
-		Token string `json:"token"`
+		Token       string `json:"token"`
+		AccessToken string `json:"access_token"`
 	}
-	if err := json.NewDecoder(tokenResp.Body).Decode(&tokenResult); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResult); err != nil {
 		return "", err
 	}
-	return tokenResult.Token, nil
+	token := tokenResult.Token
+	if token == "" {
+		token = tokenResult.AccessToken
+	}
+	if token == "" {
+		return "", fmt.Errorf("empty token in auth response")
+	}
+	return token, nil
 }
 
-// parseAuthChallenge extracts realm, service, and scope from a
-// Www-Authenticate: Bearer realm="...",service="...",scope="..." header.
 func parseAuthChallenge(header string) (realm, service, scope string) {
-	// Strip "Bearer " prefix.
 	header = strings.TrimPrefix(header, "Bearer ")
 	for _, part := range strings.Split(header, ",") {
 		part = strings.TrimSpace(part)
@@ -324,149 +573,61 @@ func parseAuthChallenge(header string) (realm, service, scope string) {
 	return
 }
 
-func parseSpeedTestImage(registryPrefix, image string) (string, string, error) {
-	image = strings.TrimSpace(strings.TrimPrefix(image, "/"))
-	if image == "" {
-		return "", "", fmt.Errorf("empty image")
+func newSpeedTestHTTPClient(up proxy.Upstream) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if up.HttpProxy != "" {
+		if proxyURL, err := url.Parse(up.HttpProxy); err == nil {
+			transport.Proxy = http.ProxyURL(proxyURL)
+		}
 	}
-	if registryPrefix == registry.DockerHubPrefix {
-		image = strings.TrimPrefix(image, registry.DockerHubPrefix+"/")
-	} else if registryPrefix != "" {
-		image = strings.TrimPrefix(image, registryPrefix+"/")
-		image = registryPrefix + "/" + image
+	return &http.Client{
+		Timeout:   speedTestTimeout,
+		Transport: transport,
 	}
-	target, err := registry.ParseReference("/" + image)
-	if err != nil {
-		return "", "", err
-	}
-	return target.ImagePath, target.Reference, nil
 }
 
-func (c *Checker) speedTest(ctx context.Context, up proxy.Upstream) (proxy.SpeedTestResult, error) {
-	var result proxy.SpeedTestResult
-
-	repository, reference, err := parseSpeedTestImage(up.RegistryPrefix, up.SpeedTestImage)
-	if err != nil {
-		return result, fmt.Errorf("invalid speed test image %q: %w", up.SpeedTestImage, err)
-	}
-
-	// Try to get an auth token if the registry requires authentication.
-	token, err := c.getRegistryToken(ctx, up.BaseURL, repository)
-	if err != nil {
-		slog.Debug("speed test: could not get auth token, proceeding without", "upstream", up.Name, "error", err)
-	}
-
-	// Step 1: Download manifest to get a layer digest and measure manifest time.
-	manifestURL := fmt.Sprintf("%s/v2/%s/manifests/%s", up.BaseURL, repository, reference)
-	slog.Info("speed test: fetching manifest", "upstream", up.Name, "repository", repository, "reference", reference, "url", manifestURL)
+func fetchManifestDebug(ctx context.Context, client *http.Client, manifestURL, token string) (*http.Response, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
 	if err != nil {
-		return result, fmt.Errorf("failed to create manifest request: %w", err)
+		return nil, nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	start := time.Now()
-	resp, err := c.speedClient.Do(req)
-	manifestTime := time.Since(start).Milliseconds()
-	result.ManifestTimeMs = manifestTime
+	resp, err := client.Do(req)
 	if err != nil {
-		return result, fmt.Errorf("manifest request failed: %w", err)
+		return nil, nil, err
 	}
-	defer resp.Body.Close()
+	body, readErr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if readErr != nil {
+		return resp, nil, readErr
+	}
+	return resp, body, nil
+}
 
-	if resp.StatusCode >= 400 {
-		return result, fmt.Errorf("manifest returned status %d", resp.StatusCode)
-	}
+func logManifestDebug(mode string, resp *http.Response, body []byte) {
+	slog.Warn("speed test: manifest response",
+		"mode", mode,
+		"url", resp.Request.URL.String(),
+		"proto", resp.Proto,
+		"status", resp.StatusCode,
+		"status_text", resp.Status,
+		"headers", resp.Header,
+		"transfer_encoding", resp.TransferEncoding,
+		"content_length_num", resp.ContentLength,
+		"body_len", len(body),
+		"body", formatLogBody(body),
+	)
+}
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return result, fmt.Errorf("failed to read manifest: %w", err)
+func formatLogBody(body []byte) string {
+	if len(body) == 0 {
+		return "<empty>"
 	}
-
-	// Try parsing as a v2 manifest first (has "layers").
-	var manifest dockerManifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return result, fmt.Errorf("failed to parse manifest: %w", err)
-	}
-
-	var digest string
-	if len(manifest.Layers) > 0 {
-		digest = manifest.Layers[0].Digest
-	} else {
-		// Manifest list — resolve to a platform-specific manifest.
-		var list dockerManifestList
-		if err := json.Unmarshal(body, &list); err != nil || len(list.Manifests) == 0 {
-			return result, fmt.Errorf("manifest has no layers and is not a manifest list")
-		}
-		digest = list.Manifests[0].Digest
-		for _, m := range list.Manifests {
-			if m.Platform.Architecture == "amd64" && m.Platform.OS == "linux" {
-				digest = m.Digest
-				break
-			}
-		}
-		archURL := fmt.Sprintf("%s/v2/%s/manifests/%s", up.BaseURL, repository, digest)
-		archReq, err := http.NewRequestWithContext(ctx, http.MethodGet, archURL, nil)
-		if err != nil {
-			return result, fmt.Errorf("failed to create arch manifest request: %w", err)
-		}
-		archReq.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json")
-		if token != "" {
-			archReq.Header.Set("Authorization", "Bearer "+token)
-		}
-		archResp, err := c.speedClient.Do(archReq)
-		if err != nil {
-			return result, fmt.Errorf("arch manifest request failed: %w", err)
-		}
-		archBody, err := io.ReadAll(archResp.Body)
-		archResp.Body.Close()
-		if err != nil {
-			return result, fmt.Errorf("failed to read arch manifest: %w", err)
-		}
-		if archResp.StatusCode >= 400 {
-			return result, fmt.Errorf("arch manifest returned status %d", archResp.StatusCode)
-		}
-		var archManifest dockerManifest
-		if err := json.Unmarshal(archBody, &archManifest); err != nil {
-			return result, fmt.Errorf("failed to parse arch manifest: %w", err)
-		}
-		if len(archManifest.Layers) == 0 {
-			return result, fmt.Errorf("arch manifest has no layers")
-		}
-		manifest = archManifest
-		digest = manifest.Layers[0].Digest
-	}
-
-	// Step 2: Download first 1MB of the first layer blob.
-	blobURL := fmt.Sprintf("%s/v2/%s/blobs/%s", up.BaseURL, repository, digest)
-	req, err = http.NewRequestWithContext(ctx, http.MethodGet, blobURL, nil)
-	if err != nil {
-		return result, fmt.Errorf("failed to create blob request: %w", err)
-	}
-	req.Header.Set("Range", "bytes=0-1048575")
-	if token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
-	}
-
-	start = time.Now()
-	resp, err = c.speedClient.Do(req)
-	if err != nil {
-		return result, fmt.Errorf("blob request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	n, err := io.Copy(io.Discard, resp.Body)
-	downloadTime := time.Since(start).Milliseconds()
-	result.DownloadTimeMs = downloadTime
-	result.DownloadBytes = n
-	if downloadTime > 0 {
-		result.DownloadSpeedKbps = float64(n) / float64(downloadTime) * 1000 / 1024
-	}
-
-	return result, nil
+	return strings.ToValidUTF8(string(body), "�")
 }
 
 func formatDuration(d time.Duration) string {

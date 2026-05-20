@@ -9,6 +9,19 @@
 - 内置 Web 管理界面
 - 单二进制部署与容器化发布
 
+## 截图
+
+<table>
+<tr>
+<td><img src="images/1.png" alt="screenshot 1"></td>
+<td><img src="images/2.png" alt="screenshot 2"></td>
+</tr>
+<tr>
+<td><img src="images/3.png" alt="screenshot 3"></td>
+<td></td>
+</tr>
+</table>
+
 ## 路径规则
 
 - Docker Hub 短路径：`domain.com/nginx:latest`

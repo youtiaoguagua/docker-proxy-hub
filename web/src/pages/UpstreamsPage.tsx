@@ -47,6 +47,7 @@ export function UpstreamsPage() {
   const [checkingHealth, setCheckingHealth] = useState(false);
   const [checkingOne, setCheckingOne] = useState<number | null>(null);
   const [speedTesting, setSpeedTesting] = useState<number | null>(null);
+  const [speedTestToast, setSpeedTestToast] = useState("");
   const [savingPriorityId, setSavingPriorityId] = useState<number | null>(null);
   const [togglingEnabledId, setTogglingEnabledId] = useState<number | null>(null);
   const [priorityDrafts, setPriorityDrafts] = useState<Record<number, string>>({});
@@ -74,6 +75,14 @@ export function UpstreamsPage() {
   useEffect(() => {
     void loadUpstreams({ initial: true });
   }, [loadUpstreams]);
+
+  useEffect(() => {
+    if (!speedTestToast) {
+      return;
+    }
+    const timer = window.setTimeout(() => setSpeedTestToast(""), 4000);
+    return () => window.clearTimeout(timer);
+  }, [speedTestToast]);
 
   const refresh = useCallback(async () => {
     await loadUpstreams();
@@ -226,9 +235,10 @@ export function UpstreamsPage() {
     try {
       const result = await speedTestUpstream(id);
       setUpstreams((prev) => prev.map((upstream) => upstream.id === id ? result.upstream : upstream));
+      setSpeedTestToast("");
       setError("");
     } catch (err) {
-      setError(formatError(err));
+      setSpeedTestToast(formatError(err));
     } finally {
       setSpeedTesting(null);
     }
@@ -307,6 +317,24 @@ export function UpstreamsPage() {
 
   return (
     <>
+      {speedTestToast && (
+        <div className="pointer-events-none fixed inset-x-0 top-4 z-50 flex justify-center px-4 sm:justify-end">
+          <div
+            role="alert"
+            className="pointer-events-auto w-full max-w-sm rounded-lg border border-destructive/30 bg-background p-4 shadow-lg"
+          >
+            <div className="flex items-start gap-3">
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-foreground">测速失败</p>
+                <p className="mt-1 break-words text-sm text-muted-foreground">{speedTestToast}</p>
+              </div>
+              <Button variant="ghost" size="sm" className="h-7 px-2" onClick={() => setSpeedTestToast("")}>关闭</Button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="mb-8 flex items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">上游管理</h1>

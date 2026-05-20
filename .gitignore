@@ -48,6 +48,9 @@ Thumbs.db
 *.swp
 *.swo
 
+tmp/
+images/
+
 # Claude local settings
 .claude/settings.local.json
 config.yaml
